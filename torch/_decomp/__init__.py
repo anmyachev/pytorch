@@ -381,12 +381,6 @@ def _get_decomp_for_cia(op):
 def core_aten_decompositions() -> Dict[torch._ops.OperatorBase, Callable]:
     decomp_table = _core_aten_decompositions_post_autograd()
 
-    # If it is fbcode change, we return the old decomposition list
-    from torch._inductor import config
-
-    if config.is_fbcode():
-        return decomp_table
-
     aten = torch.ops.aten
 
     # We are deleting custom decomp in core_aten_decomp
