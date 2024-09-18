@@ -19,8 +19,10 @@ import sys
 import textwrap
 import traceback
 import types
+import uuid
 import warnings
 import weakref
+from collections import defaultdict
 from enum import Enum
 from os.path import dirname, join
 from typing import (
@@ -98,18 +100,39 @@ cached_backends: Dict[int, CompilerFn] = {}
 unset = Unset.token
 
 
-def _maybe_set_eval_frame(callback: DynamoCallback):
+context_id_to_warmup_count: Dict[str, int] = defaultdict(int)
+
+
+def _maybe_set_eval_frame(callback: DynamoCallback, context_id: str, state: str):
+    global context_id_to_warmup_count
     # A wrapper on set_eval_frame that is guarded by a Justknob.
     # Users can disable torchDynamo by setting the JK to False.
     from torch._C._dynamo.eval_frame import set_eval_frame
 
+    assert state in ["enter", "exit"]
     if not justknobs_check("pytorch/compiler:enable_compiler_set_eval_frame"):
         torch._dynamo.utils.warn_once(
             "Dynamo disabled by Justknob: enable_compiler_set_eval_frame, skipping set_eval_frame"
         )
         return callback
     else:
-        return set_eval_frame(callback)
+        if config.warmup_runs == 0:
+            return set_eval_frame(callback)
+        else:
+            if torch._dynamo.compiled_autograd.in_compiled_autograd_region:
+                # Compiled Autograd Dynamo warmup is handled within `torch._dynamo.compiled_autograd.enable()`.
+                return set_eval_frame(callback)
+            else:
+                if state == "enter":
+                    return set_eval_frame(
+                        None
+                        if context_id_to_warmup_count[context_id] < config.warmup_runs
+                        else callback
+                    )
+                elif state == "exit":
+                    if context_id_to_warmup_count[context_id] < config.warmup_runs:
+                        context_id_to_warmup_count[context_id] += 1
+                    return set_eval_frame(callback)
 
 
 def _reset_guarded_backend_cache():
@@ -317,6 +340,7 @@ class _TorchDynamoContext:
         self.compiler_config = compiler_config
         self.cleanup_fns: List[Callable[[], Any]] = []
         self.enter_exit_hooks = []
+        self.context_id = str(uuid.uuid4())
         patch_fn()
 
         # Save the backends so that we can reset them during torch._dynamo.reset
@@ -351,11 +375,11 @@ class _TorchDynamoContext:
                 "to use torch._dynamo.optimize(...) as an annotation/decorator. "
             )
         self.cleanup_fns = [enter() for enter in self.enter_exit_hooks]
-        self.prior = _maybe_set_eval_frame(self.callback)
+        self.prior = _maybe_set_eval_frame(self.callback, self.context_id, "enter")
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         assert self.prior is not unset
-        _maybe_set_eval_frame(self.prior)
+        _maybe_set_eval_frame(self.prior, self.context_id, "exit")
         self.prior = unset
         for cleanup in self.cleanup_fns:
             cleanup()
@@ -449,7 +473,7 @@ class _TorchDynamoContext:
                     return fn(*args, **kwargs)
 
             cleanups = [enter() for enter in self.enter_exit_hooks]
-            prior = _maybe_set_eval_frame(callback)
+            prior = _maybe_set_eval_frame(callback, self.context_id, "enter")
 
             # Ensure that if an assertion occurs after graph pushes
             # something onto the DynamicLayerStack then we pop it off (the
@@ -469,7 +493,7 @@ class _TorchDynamoContext:
                     saved_dynamic_layer_stack_depth
                 )
 
-                _maybe_set_eval_frame(prior)
+                _maybe_set_eval_frame(prior, self.context_id, "exit")
                 for cleanup in cleanups:
                     cleanup()
 
@@ -555,14 +579,20 @@ class OptimizeContext(_TorchDynamoContext):
             compiler_config=compiler_config,
         )
 
+        self.compiled_autograd_ctx = None
         if config.compiled_autograd:
 
             def call_compiled_autograd():
-                assert rebuild_ctx is not None
-                compiler_fn = rebuild_ctx()
-                ctx = torch._dynamo.compiled_autograd.enable(compiler_fn)
-                ctx.__enter__()
-                return functools.partial(ctx.__exit__, None, None, None)
+                if self.compiled_autograd_ctx is None:
+                    assert rebuild_ctx is not None
+                    compiler_fn = rebuild_ctx()
+                    self.compiled_autograd_ctx = torch._dynamo.compiled_autograd.enable(
+                        compiler_fn
+                    )
+                self.compiled_autograd_ctx.__enter__()
+                return functools.partial(
+                    self.compiled_autograd_ctx.__exit__, None, None, None
+                )
 
             self.enter_exit_hooks.append(call_compiled_autograd)
 
@@ -627,11 +657,11 @@ class DisableContext(_TorchDynamoContext):
 
         @functools.wraps(fn)
         def _fn(*args, **kwargs):
-            prior = _maybe_set_eval_frame(callback)
+            prior = _maybe_set_eval_frame(callback, self.context_id, "enter")
             try:
                 return fn(*args, **kwargs)
             finally:
-                _maybe_set_eval_frame(prior)
+                _maybe_set_eval_frame(prior, self.context_id, "exit")
 
         _fn._torchdynamo_disable = True  # type: ignore[attr-defined]
 
